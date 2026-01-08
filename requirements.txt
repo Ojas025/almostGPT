@@ -2,3 +2,4 @@ numpy
 logging
 rich
 typer
+ipykernel
