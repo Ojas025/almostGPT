@@ -240,7 +240,7 @@ class BigramLanguageModel(nn.Module):
         
         # self.feed_forward = FeedForward(n_embed)
 
-        self.blocks = nn.Sequential([Block(n_embed, n_heads) for _ in range(n_layers)])
+        self.blocks = nn.Sequential(*[Block(n_embed, n_heads) for _ in range(n_layers)])
         
         self.layer_norm = LayerNorm(n_embed)
 
