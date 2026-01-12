@@ -11,6 +11,7 @@ Notes:
     - Includes ugly number optimization
     - Gradient clipping to a norm -> 1.0
     - Learning rate schedule using cosine decay
+    - Add parameter decay to introduce regularization
 """
 
 from dataclasses import dataclass
@@ -21,11 +22,12 @@ from rich.console import Console
 from rich.panel import Panel
 import tiktoken
 from time import time
+import math
 
 console = Console()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-panel = Panel("ProbablyGPT", title="ProbablyGPT", title_align="center", style="bold white on red")
+panel = Panel("An implementation of GPT-like decoder-only transformer", title="ProbablyGPT")
 console.print(panel)
 console.print(f"Using device: [yellow]{device}[/yellow]")
 
@@ -202,6 +204,38 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # get params that require grad
+        grad_params = { name: param for name, param in self.named_parameters() }
+        grad_params = { name: param for name, param in grad_params.items() if param.requires_grad }
+
+        # create param groups based on whether the parameter is to be decayed
+        # decay is usually not applied on params with dim < 2 (biases, layerNorm, scale, etc)
+        decay_params = [p for n, p in grad_params.items() if p.dim() >= 2]
+        no_decay_params = [p for n, p in grad_params.items() if p.dim() < 2]
+
+        optim_groups = [
+            { 'params': decay_params, 'weight_decay': weight_decay },
+            { 'params': no_decay_params, 'weight_decay': 0.0 }
+        ]
+        
+        n_decay = sum(p.numel() for p in decay_params)
+        n_no_decay = sum(p.numel() for p in no_decay_params)
+        
+        console.print(f"\nTotal parameters: {len(self.parameters())}")
+        console.print(f"Decayed parameters: {n_decay}")
+        console.print(f"Non-Decayed parameters: {n_no_decay}")
+
+        
+        fused = False
+        if "cuda" in device:
+            fused = True
+        
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=[0.9,0.95], eps=1e-8, fused=fused)
+        
+        return optimizer
+        
     
     def forward(self, index, targets=None):
         # index: [B,T]
@@ -262,6 +296,31 @@ class DataLoader:
             
         return x,y            
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_learning_rate(step):
+    """
+    Cosine decay learning rate schedule with linear warmup
+    """
+    
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+
+    if step > max_steps:
+        return min_lr
+    
+    # progress after warmup
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    
+    # maps -1 -> 0, 1 -> 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    
+    return min_lr + coeff * (max_lr - min_lr)
+
 num_return_sequences = 5
 max_length = 50
      
@@ -275,10 +334,13 @@ model.compile()
 
 console.print(f"Initialized model")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
 data_loader = DataLoader(B=4,T=1024)
 
-for i in range(1, 51):
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+
+for step in range(max_steps):
     t0 = time()
     x,y = data_loader.next_batch()
     x,y = x.to(device), y.to(device)
@@ -287,6 +349,15 @@ for i in range(1, 51):
     with torch.autocast(device_type=device, dtype=torch.float16):
         logits, loss = model(x,y)
     loss.backward()
+    norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    # get learning rate 
+    lr = get_learning_rate(step)
+    
+    # update learning rate in params
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
     optimizer.step()
     
     torch.cuda.synchronize()
@@ -294,7 +365,7 @@ for i in range(1, 51):
     dt = (t1-t0)*1000
     tokens_per_sec = (data_loader.B * data_loader.T) / (t1 - t0)
     
-    print(f"Step {i} | Loss: {loss.item():.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+    print(f"Step {step+1} | Loss: {loss.item():.4f} | lr: {lr:.4e} | Norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
 
 
 # console.print(f"[green]Tokenized input text[/green]")
