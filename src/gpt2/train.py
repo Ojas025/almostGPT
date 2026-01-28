@@ -5,34 +5,40 @@ Changes in GPT-2 from the original transformer paper:
 """
 
 """
-Notes:
+Stuff implemented:
     - Use of GeLU instead of ReLU to deal with dead activations, as GeLU always contributes a local gradient
-    - Includes Flash Attention for optimization
     - Includes ugly number optimization
     - Gradient clipping to a norm -> 1.0
     - Learning rate schedule using cosine decay
     - Add parameter decay to introduce regularization
+    - Implement gradient accumulation to increase batch_size
+    - Implement Learned Positional Embedding
+    - Implement Sinusoidal Positional Embedding 
+    - Implement Rotary Positional Embeddings (RoPE)
+    - Added Gradient Scaling to avoid gradient underflow due to Automatic Mixed Precision (float16)
+    - Added top_k and top_p filtering
 """
 
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-# from torch.utils.cpp_extension import load
 from rich.console import Console
 from rich.panel import Panel
 import tiktoken
 from time import time
 import math
+from pathlib import Path
 
 console = Console()
-device = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATASET_PATH = Path("../../data/shakespeare.txt").resolve()
 
 panel = Panel("An implementation of GPT-like decoder-only transformer", title="ProbablyGPT")
 console.print(panel)
-console.print(f"Using device: [yellow]{device}[/yellow]")
+console.print(f"Using device: [yellow]{DEVICE}[/yellow]")
 
-def load_data():
-    with open("../../data/shakespeare.txt", "r") as file:
+def load_data(path: str):
+    with open(path, "r") as file:
         text = file.read()
     
     return text        
@@ -68,7 +74,50 @@ class GPTConfig:
 #         grad_q, grad_k, grad_v = flash_attention_kernel(grad_outputs, q, k, v, scale)
         
 #         return grad_q,grad_k,grad_v,None
+
+class LearnedPositionalEmbedding(nn.Module):
+    def __init__(self, context_length, n_embed):
+        super().__init__()
+        self.embedding = nn.Embedding(context_length, n_embed)
+    
+    def forward(self, x):
+        _, T, _ = x.shape
         
+        pos = torch.arange(0, T, device=DEVICE, dtype=torch.long)
+        pos_emb = self.embedding(pos).unsqueeze(0) # [B,T,n_embed]
+        
+        return pos_emb
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, T, n_embed):
+        super().__init__()
+        
+        positions = torch.arange(T, device=DEVICE)
+        
+        base = 10000.0
+        denominator = torch.pow(base, 2 * torch.arange(n_embed // 2) / n_embed) # Generate index 'i' for each timestep
+        
+        # For each timestep, one positional embedding
+        embeddings = torch.zeros(T, n_embed, dtype=torch.float16)
+        
+        angles = positions / denominator
+        embeddings[:, 0::2] = torch.sin(angles) # sine for even positions
+        
+        embeddings[:, 1::2] = torch.cos(angles) # cosine for odd positions
+        
+        self.register_buffer("PE", embeddings)
+    
+    def forward(self, x):
+        _, T, _ = x.shape
+        return self.PE[:T].unsqueeze(0)
+    
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        pass
+       
 class MaskedSelfAttention(nn.Module):
     """Masked/Causal Self Attention"""
 
@@ -171,7 +220,6 @@ class Block(nn.Module):
         
         return x
 
-
 class GPT(nn.Module):
     """Generative Pretrained Transformer"""
 
@@ -179,10 +227,13 @@ class GPT(nn.Module):
         super().__init__()
         
         self.config = config
+        self.tokenizer = Tokenizer()
         
         self.transformer = nn.ModuleDict(dict(
             token_embedding = nn.Embedding(config.vocab_size, config.n_embed), # contextual embeddings
-            positional_embedding = nn.Embedding(config.context_length, config.n_embed), # positional embeddings
+            positional_embedding = LearnedPositionalEmbedding(config.context_length, config.n_embed), # learned positional embeddings
+            # positional_embedding = SinusoidalPositionalEmbedding(config.context_length, config.n_embed) # sinusoidal positional embedding
+            # positional_embedding = RotaryPositionalEmbedding(config.n_head, config.n_embed // config.n_head),
             blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # decoder blocks
             layer_norm_f = LayerNorm(config.n_embed) # additional layernorm
         ))
@@ -223,9 +274,8 @@ class GPT(nn.Module):
         n_decay = sum(p.numel() for p in decay_params)
         n_no_decay = sum(p.numel() for p in no_decay_params)
         
-        console.print(f"\nTotal parameters: {len(self.parameters())}")
-        console.print(f"Decayed parameters: {n_decay}")
-        console.print(f"Non-Decayed parameters: {n_no_decay}")
+        console.print(f"\nDecayed parameters: {n_decay}")
+        console.print(f"Non-Decayed parameters: {n_no_decay}\n")
 
         
         fused = False
@@ -235,22 +285,49 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=[0.9,0.95], eps=1e-8, fused=fused)
         
         return optimizer
+    
+    def top_k(self, logits, k):
+        filtered = logits.clone()
+        v, _ = torch.topk(filtered, k, dim=-1)
+        mask = filtered < v[..., -1, None]
+        filtered[mask] = float("-inf")
         
+        return filtered
+    
+    def top_p(self, logits, p):
+        assert 0.0 < p < 1.0, "p must be within [0,1]"
+        
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        probabilities = torch.softmax(sorted_logits, dim=-1)
+        cumsum = torch.cumsum(probabilities, dim=-1)
+        
+        # mask all tokens with cumulative probability > p
+        mask = cumsum > p
+        mask[..., 0] = False # keep at least the first token        
+
+        sorted_logits[mask] = float("-inf")
+        
+        # unsort
+        filtered = torch.full_like(sorted_logits, float("-inf"))
+        filtered.scatter_(1, sorted_indices, sorted_logits)
+        
+        return filtered
     
     def forward(self, index, targets=None):
         # index: [B,T]
         B,T = index.size()
+        H = self.config.n_head
+        D = self.config.n_embed // H
         
         if T > self.config.context_length:
             console.print(f"[red]Cannot forward context of length {T}[/red]")
             return
         
-        pos = torch.arange(0, T, device=device, dtype=torch.long)
-        pos_emb = self.transformer.positional_embedding(pos) # [B,T,n_embed]
+        x = self.transformer.token_embedding(index) # [B,T,n_embed]
         
-        tok_emb = self.transformer.token_embedding(index) # [B,T,n_embed]
+        pos_emb = self.transformer.positional_embedding(x)
         
-        x = tok_emb + pos_emb
+        x = x + pos_emb
         
         for block in self.transformer.blocks:
             x = block(x)
@@ -264,8 +341,48 @@ class GPT(nn.Module):
             loss = nn.CrossEntropyLoss()(logits.view(-1, logits.size(-1)), targets.view(-1))
         
         return logits, loss
-
+    
+    @torch.no_grad()
+    def generate(self, prompt, max_output_tokens: int = 200, temperature: float = 1.0, k: int = 50, p: float = 0.95):
+        self.eval()
+        
+        tokens = self.tokenizer.encode(prompt).unsqueeze(0).to(DEVICE) # [1, T]
+        
+        while tokens.size(1) < max_output_tokens:
+            tokens_curr = tokens[:, -self.config.context_length:]
+            logits, _ = self(tokens_curr)
+            logits = logits[:, -1, :] # logits at the last position
+            
+            logits = self.top_k(logits, k)
+            logits = self.top_p(logits, p)
+            logits = logits / max(temperature, 1e-6)
+            
+            probabilities = torch.softmax(logits, dim=-1)
+            
+            next_token = torch.multinomial(probabilities, 1)
+            
+            # append new col to the sequence
+            tokens = torch.cat((tokens, next_token), dim=1)
+            
+        return tokens
+        
 # --------------------------------------------------------------------
+
+class Tokenizer:
+    def __init__(self):
+        self.encoder = tiktoken.get_encoding("gpt2")
+    
+    def encode(self, data):
+        tokens = self.encoder.encode(data)
+        tokens = torch.tensor(tokens, device=DEVICE)
+        
+        return tokens
+    
+    def decode(self, ids):
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+            
+        return self.encoder.decode(ids)
 
 class DataLoader:
     """Data loader class implementation"""
@@ -274,10 +391,9 @@ class DataLoader:
         self.B = B
         self.T = T
         
-        data = load_data()
-        encoder = tiktoken.get_encoding("gpt2")
-        tokens = encoder.encode(data)
-        self.tokens = torch.tensor(tokens, device=device)
+        data = load_data(DATASET_PATH)
+        self.tokenizer = Tokenizer()
+        self.tokens = self.tokenizer.encode(data)
         
         self.index = 0
         
@@ -321,78 +437,85 @@ def get_learning_rate(step):
     
     return min_lr + coeff * (max_lr - min_lr)
 
-num_return_sequences = 5
-max_length = 50
-     
-# torch.set_float32_matmul_precision("high")
-     
-# init model   
-model = GPT(GPTConfig(vocab_size=50304)) # remove ugly number 50257 -> 50304
-model.eval()
-model.to(device)
-model.compile()
-
-console.print(f"Initialized model")
-
-# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
-data_loader = DataLoader(B=4,T=1024)
-
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
-
-
-for step in range(max_steps):
-    t0 = time()
-    x,y = data_loader.next_batch()
-    x,y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    
-    with torch.autocast(device_type=device, dtype=torch.float16):
-        logits, loss = model(x,y)
-    loss.backward()
-    norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-    # get learning rate 
-    lr = get_learning_rate(step)
-    
-    # update learning rate in params
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    
-    optimizer.step()
-    
-    torch.cuda.synchronize()
-    t1 = time()
-    dt = (t1-t0)*1000
-    tokens_per_sec = (data_loader.B * data_loader.T) / (t1 - t0)
-    
-    print(f"Step {step+1} | Loss: {loss.item():.4f} | lr: {lr:.4e} | Norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
-
-
-# console.print(f"[green]Tokenized input text[/green]")
-
-# while tokens.size(1) < max_length:
-#     with torch.no_grad():
-#         logits = model(tokens)
-#         logits = logits[:,-1,:] # logits at the last position
-
-#         temperature = 0.9
-#         probabilities = torch.softmax(logits / temperature, dim=-1)
+if __name__ == "__main__":
+    num_return_sequences = 5
+    max_length = 50
         
-#         # topk sampling
-#         top_k_probs, top_k_indices = torch.topk(probabilities, 50, dim=-1)
-#         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+    # torch.set_float32_matmul_precision("high")
         
-#         index = torch.multinomial(top_k_probs, 1)
+    total_batch_size = 524288 # ~0.5M in number of tokens
+    B = 4
+    T = 1024     
         
-#         col = torch.gather(top_k_indices, -1, index)
+    assert total_batch_size % (B*T) == 0, "total_batch_size is divisible by B*T"
+
+    gradient_accumulation_steps = total_batch_size // (B*T)
+
+    console.print(f"\nTotal desired batch size: {total_batch_size}")
+    console.print(f"Gradient accumulation steps: {gradient_accumulation_steps}\n")
         
-#         # append new col to the sequence
-#         tokens = torch.cat((tokens, col), dim=1)
-        
-# console.print(f"[green]Model trained.\n[/green]")        
-        
-# for i in range(num_return_sequences):
-#     x = tokens[i, :max_length].tolist()
-#     decoded = encoding.decode(x)
+    # init model   
+    model = GPT(GPTConfig(vocab_size=50304)) # remove ugly number 50257 -> 50304
+    model.eval()
+    model.to(DEVICE)
     
-    # print(decoded)
+    if hasattr(torch, "compile"):
+        model.compile()
+
+    console.print(f"Initialized model")
+
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
+    data_loader = DataLoader(B,T)
+
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=DEVICE)
+    scaler = torch.amp.GradScaler(device=DEVICE)
+
+    # TRAINING LOOP
+    for step in range(max_steps):
+        t0 = time()
+        optimizer.zero_grad()
+
+        loss_accum = 0.0
+        for micro_step in range(gradient_accumulation_steps):
+            x,y = data_loader.next_batch()
+            x,y = x.to(DEVICE), y.to(DEVICE)
+            
+            with torch.autocast(device_type=DEVICE, dtype=torch.float16):
+                logits, loss = model(x,y)
+                
+            # normalizer
+            loss /= gradient_accumulation_steps
+            loss_accum += loss.detach()
+
+            scaler.scale(loss).backward()
+            
+        norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # get learning rate 
+        lr = get_learning_rate(step)
+        
+        # update learning rate in params
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        # without scaling
+        # optimizer.step()
+
+        # with scaling
+        scaler.step(optimizer)
+        scaler.update()
+        
+        torch.cuda.synchronize()
+        t1 = time()
+
+        tokens_processed = data_loader.B * data_loader.T * gradient_accumulation_steps
+        dt = (t1-t0)*1000
+        tokens_per_sec = tokens_processed / dt
+        
+        print(f"Step {step+1} | Loss: {loss_accum.item():.4f} | lr: {lr:.4e} | Norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")     
+            
+    # for i in range(num_return_sequences):
+    #     x = tokens[i, :max_length].tolist()
+    #     decoded = encoding.decode(x)
+        
+    #     print(decoded)
