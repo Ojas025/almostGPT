@@ -7,6 +7,7 @@ Changes in GPT-2 from the original transformer paper:
 """
 Stuff implemented:
     - Use of GeLU instead of ReLU to deal with dead activations, as GeLU always contributes a local gradient
+    - Use SwiGLU over GeLU, uses Swish activation (x.sigmoid(x)) with Gated Linear Units
     - Includes ugly number optimization
     - Gradient clipping to a norm -> 1.0
     - Learning rate schedule using cosine decay
@@ -14,9 +15,17 @@ Stuff implemented:
     - Implement gradient accumulation to increase batch_size
     - Implement Learned Positional Embedding
     - Implement Sinusoidal Positional Embedding 
-    - Implement Rotary Positional Embeddings (RoPE)
     - Added Gradient Scaling to avoid gradient underflow due to Automatic Mixed Precision (float16)
     - Added top_k and top_p filtering
+    - Add RMS Norm over LayerNorm to reduce computations
+    - Added checkpointing
+    
+TODO:
+    - Implement Rotary Positional Embeddings (RoPE)
+    - Implement Grouped Multi-Query Attention
+    - Implement Sliding Window Attention
+    - Implement Rolling KV Cache
+    - Custom Flash Attention? (Cuda)
 """
 
 from dataclasses import dataclass
@@ -28,6 +37,14 @@ import tiktoken
 from time import time
 import math
 from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+import logging
+
+from logger import configure_logging
+
+configure_logging()
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -144,20 +161,29 @@ class MaskedSelfAttention(nn.Module):
         # V = self.value(x) # [B,T,d_head]
         
         qkv = self.qkv_proj(x) # [B,T,3*C]
-        qkv = qkv.view(B,T,self.config.n_head, 3, self.d_head) # [B,T,n_head,3,d_head]
+        qkv = qkv.view(B, T,self.config.n_head, 3, self.d_head) # [B,T,n_head,3,d_head]
         Q,K,V = qkv[...,0,:], qkv[...,1,:], qkv[...,2,:] # [B,T,n_head,d_head]
         
+        Q = Q.transpose(1, 2) # [B, n_head, T, d_head]
+        K = K.transpose(1, 2) # [B, n_head, T, d_head]
+        V = V.transpose(1, 2) # [B, n_head, T, d_head]
+
         if self.is_flash_attention:
             output = nn.functional.scaled_dot_product_attention(Q,K,V,is_causal=True,scale=self.scale)
         else:
-            W = (Q @ K.transpose(-2,-1)) * self.scale # [B,T,n_head,T]
+            # matrix multiplication happens on last 2 dimensions
+            # [B, n_head, T, d_head] @ [B, n_head, d_head, T]
+            W = (Q @ K.transpose(-2,-1)) * self.scale # [B, n_head, T, T]
             mask = self.tril[:T, :T].unsqueeze(0).unsqueeze(0)
             W = W.masked_fill(mask == 0, torch.finfo(W.dtype).min)
             W = torch.softmax(W, dim=-1) # apply row-wise
-            output = W @ V # [B,T,n_head,d_head]
+            
+            # [B, n_head, T, T] @ [B, n_head, T, d_head]
+            output = W @ V # [B, n_head, T, d_head]
         
-        output = output.reshape(B,T,C)
-        return self.output_proj(output)
+        output = output.transpose(1,2) # [B, T, n_head, d_head]
+        output = output.contiguous().view(B,T,C) # n_head * d_head -> C
+        return self.output_proj(output) # [B, T, C]
 
 class LayerNorm(nn.Module):
     """Layern Normalization"""
@@ -181,22 +207,68 @@ class LayerNorm(nn.Module):
         
         return output
     
-    def parameters(self):
-        return [self.gamma, self.beta]
+class RMSNorm(nn.Module):
+    """
+        Root Mean Square Layer Normalization
+        
+    :param dim: model dimensions
+    :param eps: epsilon vale, default 1e-8
+    """
+    def __init__(self, dim: int, eps: float = 1e-8):
+        super().__init__()
+    
+        self.dim = dim
+        self.eps = eps
 
+        self.scale = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x):
+        rms = torch.sqrt(
+            torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps
+        )
+        
+        return (x / rms) * self.scale
+    
+class SwiGLU(nn.Module):
+    """
+        SwiGLU Feed Forward Network
+        - (x.w1) x swish(x.w2) . w3
+    """
+    
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.projection = nn.Linear(in_dim, out_dim * 2)
+        self.silu = nn.SiLU()
+    
+    def forward(self, x):
+        x1, x2 = self.projection(x).chunk(2, dim=-1) # split
+        return x1 * self.silu(x2)
+    
 class FeedForward(nn.Module):
     """Feed forward neural networm"""
 
-    def __init__(self, config: GPTConfig, approximate=False):
+    def __init__(self, config: GPTConfig, approximate=False, activation="swiglu"):
         super().__init__()
         
         self.config = config
         
-        self.network = nn.Sequential(
-            nn.Linear(config.n_embed, 4*config.n_embed),
-            nn.GELU(approximate="tanh") if approximate else nn.GELU(),
-            nn.Linear(4*config.n_embed, config.n_embed)
-        )
+        if activation == "gelu":
+            self.network = nn.Sequential(
+                nn.Linear(config.n_embed, 4*config.n_embed),
+                nn.GELU(approximate="tanh") if approximate else nn.GELU(),
+                nn.Linear(4*config.n_embed, config.n_embed)
+            )
+        elif activation == "relu":
+            self.network = nn.Sequential(
+                nn.Linear(config.n_embed, 4*config.n_embed),
+                nn.ReLU(),
+                nn.Linear(4*config.n_embed, config.n_embed)
+            )
+        elif activation == "swiglu":
+            self.network = nn.Sequential(
+                SwiGLU(config.n_embed, 4 * config.n_embed),
+                nn.Linear(4 * config.n_embed, config.n_embed)
+            )
         
     def forward(self, x):
         return self.network(x)
@@ -204,19 +276,24 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     """Transformer decoder block"""
     
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, norm: str = "rms"):
         super().__init__()
         
         self.config = config
         
-        self.layer_norm_1 = LayerNorm(config.n_embed)
+        if norm == "layer":
+            self.norm_1 = LayerNorm(config.n_embed)
+            self.norm_2 = LayerNorm(config.n_embed)
+        elif norm == "rms":
+            self.norm_1 = RMSNorm(config.n_embed)
+            self.norm_2 = RMSNorm(config.n_embed)
+        
         self.attention = MaskedSelfAttention(config)
-        self.layer_norm_2 = LayerNorm(config.n_embed)
         self.feed_forward = FeedForward(config)
         
     def forward(self, x):
-        x = x + self.attention(self.layer_norm_1(x))
-        x = x + self.feed_forward(self.layer_norm_2(x))
+        x = x + self.attention(self.norm_1(x))
+        x = x + self.feed_forward(self.norm_2(x))
         
         return x
 
@@ -315,9 +392,9 @@ class GPT(nn.Module):
     
     def forward(self, index, targets=None):
         # index: [B,T]
-        B,T = index.size()
-        H = self.config.n_head
-        D = self.config.n_embed // H
+        _,T = index.size()
+        # H = self.config.n_head
+        # D = self.config.n_embed // H
         
         if T > self.config.context_length:
             console.print(f"[red]Cannot forward context of length {T}[/red]")
@@ -343,19 +420,21 @@ class GPT(nn.Module):
         return logits, loss
     
     @torch.no_grad()
-    def generate(self, prompt, max_output_tokens: int = 200, temperature: float = 1.0, k: int = 50, p: float = 0.95):
+    def generate(self, tokens, max_output_tokens: int = 200, num_return_sequences: int = 3, temperature: float = 1.0, k: int = 50, p: float = 0.95):
         self.eval()
         
-        tokens = self.tokenizer.encode(prompt).unsqueeze(0).to(DEVICE) # [1, T]
+        tokens = tokens.unsqueeze(0) # [1, T]
+        tokens = tokens.repeat(num_return_sequences, 1) # [num_return_sequences, T]
+        tokens = tokens.to(DEVICE)
         
         while tokens.size(1) < max_output_tokens:
             tokens_curr = tokens[:, -self.config.context_length:]
             logits, _ = self(tokens_curr)
             logits = logits[:, -1, :] # logits at the last position
             
+            logits = logits / max(temperature, 1e-6)
             logits = self.top_k(logits, k)
             logits = self.top_p(logits, p)
-            logits = logits / max(temperature, 1e-6)
             
             probabilities = torch.softmax(logits, dim=-1)
             
@@ -384,20 +463,61 @@ class Tokenizer:
             
         return self.encoder.decode(ids)
 
-class DataLoader:
+import numpy as np
+import os
+
+def load_tokens(filepath: str):
+    tokens = np.load(filepath)
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    
+    return tokens
+
+from hellaswag import iterate_examples, get_formatted_example
+
+class HellaSwagDataset(Dataset):
+    def __init__(self, split="train"):
+        self.examples = list(iterate_examples(split))
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, index):
+        example = self.examples[index]
+        data, tokens, mask, label = get_formatted_example(example)
+        
+        return tokens, mask, label
+
+class CustomDataLoader:
     """Data loader class implementation"""
 
-    def __init__(self, B, T):
+    def __init__(self, B, T, split="train", dataset="shakespeare"):
         self.B = B
         self.T = T
+        self.dataset = dataset
         
-        data = load_data(DATASET_PATH)
-        self.tokenizer = Tokenizer()
-        self.tokens = self.tokenizer.encode(data)
+        if dataset == "shakespeare":
+            data = load_data(DATASET_PATH)
+            self.tokenizer = Tokenizer()
+            self.tokens = self.tokenizer.encode(data)
+        elif dataset == "fineweb":
+            dataset_dir = Path(__file__).parent / "edu_fineweb10B"
+            shards = os.listdir(dataset_dir)
+            self.shards = [f"{dataset_dir}/{s}" for s in shards if split in s]
+            self.current_shard = 0
+            self.tokens = load_tokens(self.shards[self.current_shard])
+
+            assert len(self.shards) > 0, f"No shards found for split {split}"
+
+        assert split in {"train", "val"}
         
-        self.index = 0
-        
+        self.reset()
         console.print(f"Loaded {len(self.tokens)} tokens")
+        
+    def reset(self):
+        if self.dataset == "fineweb":
+            self.current_shard = 0
+            self.tokens = load_tokens(self.shards[self.current_shard])
+        self.index = 0
 
     def next_batch(self):
         buffer = self.tokens[self.index:self.index+self.B*self.T+1]
@@ -408,14 +528,16 @@ class DataLoader:
         self.index += self.B*self.T
         
         if self.index + (self.B*self.T+1) > len(self.tokens):
+            if self.dataset == "fineweb":
+                self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.index = 0
             
         return x,y            
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 100
+max_steps = 19073
 
 def get_learning_rate(step):
     """
@@ -437,10 +559,111 @@ def get_learning_rate(step):
     
     return min_lr + coeff * (max_lr - min_lr)
 
-if __name__ == "__main__":
-    num_return_sequences = 5
-    max_length = 50
+def train_model(step: int):
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    for micro_step in range(gradient_accumulation_steps):
+        x,y = train_loader.next_batch()
+        x,y = x.to(DEVICE), y.to(DEVICE)
         
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            logits, loss = model(x,y)
+            
+        # scale gradient using MEAN to account for gradient accumulation
+        loss /= gradient_accumulation_steps
+        loss_accum += loss.detach()
+
+        scaler.scale(loss).backward()
+        
+    norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    # determine learning rate for this iteration 
+    lr = get_learning_rate(step)
+    
+    # update learning rate in params
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
+    # without scaling
+    # optimizer.step()
+
+    # with scaling
+    scaler.step(optimizer)
+    scaler.update()
+    
+    torch.cuda.synchronize() # wait for GPU to finish
+    
+    return loss_accum, lr, norm
+
+@torch.no_grad()
+def evaluate_model():
+    model.eval()
+    
+    # reset data loader
+    val_loader.reset()
+    val_loss_accum = 0.0
+    val_loss_steps = 20
+    
+    for _ in range(val_loss_steps):
+        x, y = val_loader.next_batch()
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        
+        with torch.autocast(dtype=torch.float16, device_type="cuda"):
+            _, loss = model(x, y)
+            
+        val_loss_accum += loss.detach()
+        loss /= val_loss_steps
+    
+    console.print(f"\n[green]Validation Loss: [/green]{val_loss_accum.item():.4f}\n")
+    logger.info(f"Step {step}, Validation Loss {val_loss_accum.item():.4f}")
+
+def save_checkpoint(step, model, optimizer, scaler, path="checkpoints"):
+    os.makedirs(path, exist_ok=True)
+    
+    checkpoint = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict()
+    }
+    
+    torch.save(checkpoint, f"{path}/checkpoint_step_{step}.pt")
+    console.print(f"[green]Checkpoint saved[/green]")
+
+def load_checkpoint(path, model, optimizer, scalers):
+    checkpoint = torch.load(path, map_location=DEVICE)
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scaler.load_state_dict(checkpoint["scaler"])
+    
+    console.print(f"[green]Checkpoint loaded[/green]")
+    
+    return checkpoint["step"]
+
+def get_predicted_row(tokens, mask, logits):
+    shifted_logits = logits[..., :-1, :].contiguous()
+    shifted_tokens = logits[..., 1:, :].contiguous()
+    
+    flattened_logits = shifted_logits.view(-1, shifted_logits.size(-1))
+    flattened_tokens = shifted_tokens.view(-1)
+    
+    losses = nn.CrossEntropyLoss()(flattened_logits, flattened_tokens, reduction="none")
+    losses = losses.view(tokens.size(0), -1)
+    
+    shifted_mask = mask[..., 1:, :].contiguous()
+    masked_loss = losses * shifted_mask
+    
+    sum_loss = masked_loss.sum(dim=1)
+    avg_loss = sum_loss / shifted_mask.sum(dim=1)
+    
+    prediction = avg_loss.argmin().item()
+    
+    return prediction
+
+
+if __name__ == "__main__":
     # torch.set_float32_matmul_precision("high")
         
     total_batch_size = 524288 # ~0.5M in number of tokens
@@ -465,57 +688,88 @@ if __name__ == "__main__":
     console.print(f"Initialized model")
 
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
-    data_loader = DataLoader(B,T)
+    train_loader = CustomDataLoader(B,T, split="train", dataset="shakespeare")
+    val_loader = CustomDataLoader(B, T, split="val", dataset="shakespeare")
+
+    # Hellaswag 
+    hellaswag_dataset = HellaSwagDataset(split="train")
+    hellaswag_dataloader = DataLoader(hellaswag_dataset, batch_size=4, shuffle=True)
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=DEVICE)
-    scaler = torch.amp.GradScaler(device=DEVICE)
+    scaler = torch.amp.GradScaler(device=DEVICE, enabled=(DEVICE == "cuda"))
 
-    # TRAINING LOOP
-    for step in range(max_steps):
-        t0 = time()
-        optimizer.zero_grad()
+    step = 0
+    
+    try:
+        while step < max_steps:
 
-        loss_accum = 0.0
-        for micro_step in range(gradient_accumulation_steps):
-            x,y = data_loader.next_batch()
-            x,y = x.to(DEVICE), y.to(DEVICE)
-            
-            with torch.autocast(device_type=DEVICE, dtype=torch.float16):
-                logits, loss = model(x,y)
+            is_last_step = step == (max_steps - 1)
+
+            # Evaluate
+            if step % 250 == 0:
+                evaluate_model()
                 
-            # normalizer
-            loss /= gradient_accumulation_steps
-            loss_accum += loss.detach()
+            # Save checkpoint
+            if step > 0 and (step % 5000 == 0 or is_last_step):
+                if is_last_step:
+                    console.print("\n[green]Saving final model...[/green]")
+                    
+                save_checkpoint(step, model, optimizer, scaler)
 
-            scaler.scale(loss).backward()
             
-        norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        # get learning rate 
-        lr = get_learning_rate(step)
-        
-        # update learning rate in params
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        # without scaling
-        # optimizer.step()
-
-        # with scaling
-        scaler.step(optimizer)
-        scaler.update()
-        
-        torch.cuda.synchronize()
-        t1 = time()
-
-        tokens_processed = data_loader.B * data_loader.T * gradient_accumulation_steps
-        dt = (t1-t0)*1000
-        tokens_per_sec = tokens_processed / dt
-        
-        print(f"Step {step+1} | Loss: {loss_accum.item():.4f} | lr: {lr:.4e} | Norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")     
+            # Hellaswag
+            if step > 0 and (step % 250 == 0 or is_last_step):
+                num_correct_norm = 0
+                num_total = 0
+                
+                with torch.no_grad():
+                    for tokens, mask, label in hellaswag_dataloader:
+                        tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
+                        
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            logits, loss = model(tokens)
+                            
+                        predicted_norm = get_predicted_row(tokens, mask, logits)
+                    
+                num_total += 1
+                num_correct_norm = (predicted_norm == label)
+                
+                accuracy = num_correct_norm / num_total    
+                
+                console.print(f"\n[green]Hellaswag Accuracy: [/green]{accuracy:.4f}\n")
+                logger.info(f"Step {step}, Hellaswag accuracy {accuracy}")
             
-    # for i in range(num_return_sequences):
-    #     x = tokens[i, :max_length].tolist()
-    #     decoded = encoding.decode(x)
-        
-    #     print(decoded)
+            t0 = time()
+            loss_accum, lr, norm = train_model(step) 
+            t1 = time()
+
+            tokens_processed = train_loader.B * train_loader.T * gradient_accumulation_steps
+            dt = (t1-t0)
+            tokens_per_sec = tokens_processed / dt
+            
+            print(f"Step {step} | Loss: {loss_accum.item():.4f} | lr: {lr:.4e} | Norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+            logger.info(f"Step {step}, Loss: {loss_accum.item():.4f}")
+            
+            step += 1
+    except KeyboardInterrupt:
+        console.print(f"[red]Keyboard interrupt detected[/red]")
+        console.print(f"[red]Saving checkpoint...[/red]")
+
+        save_checkpoint(step, model, optimizer, scaler)
+    
+    num_return_sequences = 3
+    max_length = 32
+    
+    tokenizer = Tokenizer()
+
+    prompt = "Hello, I'm a language model"
+    input_tokens = tokenizer.encode(prompt)
+
+    generated_tokens = model.generate(tokens=input_tokens, max_output_tokens=max_length, num_return_sequences=num_return_sequences)      
+
+    print()
+    for i in range(num_return_sequences):
+        tokens = generated_tokens[i, :max_length].tolist()
+        decoded_tokens = tokenizer.decode(tokens)
+        console.print(f"{i}: {decoded_tokens}")
+    print()
