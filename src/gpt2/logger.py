@@ -16,9 +16,6 @@ def configure_logging(debug_level="INFO"):
             "default": {
                 "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
                 "datefmt": "%d-%m-%Y %H:%M:%S"
-            },
-            "json": {
-                "()": "app.logging.formatters.JsonFormatter"
             }
         },
         "handlers": {
@@ -32,15 +29,15 @@ def configure_logging(debug_level="INFO"):
                 "mode": "a",
                 "encoding": "utf-8"
             },
-            "console": {
-                "class": "logging.StreamHandler",
-                "formatter": "default",
-                "level": debug_level
-            }
+            # "console": {
+            #     "class": "logging.StreamHandler",
+            #     "formatter": "default",
+            #     "level": debug_level
+            # }
         },
         "root": {
             "level": "DEBUG",
-            "handlers": ["file", "console"]
+            "handlers": ["file"]
         }
     }
 

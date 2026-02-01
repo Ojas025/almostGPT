@@ -18,10 +18,10 @@ Stuff implemented:
     - Added Gradient Scaling to avoid gradient underflow due to Automatic Mixed Precision (float16)
     - Added top_k and top_p filtering
     - Add RMS Norm over LayerNorm to reduce computations
-    - Added checkpointing
+    - Added checkpointing to resume training state
+    - Implement Rotary Positional Embeddings (RoPE)
     
 TODO:
-    - Implement Rotary Positional Embeddings (RoPE)
     - Implement Grouped Multi-Query Attention
     - Implement Sliding Window Attention
     - Implement Rolling KV Cache
@@ -39,6 +39,7 @@ import math
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import logging
+import random
 
 from logger import configure_logging
 
@@ -48,9 +49,9 @@ logger = logging.getLogger(__name__)
 
 console = Console()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATASET_PATH = Path("../../data/shakespeare.txt").resolve()
+DATASET_PATH = Path("../data/shakespeare.txt").resolve()
 
-panel = Panel("An implementation of GPT-like decoder-only transformer", title="ProbablyGPT")
+panel = Panel("An implementation of GPT-like decoder-only transformer", title="AlmostGPT")
 console.print(panel)
 console.print(f"Using device: [yellow]{DEVICE}[/yellow]")
 
@@ -97,10 +98,13 @@ class LearnedPositionalEmbedding(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(context_length, n_embed)
     
-    def forward(self, x):
+    def forward(self, x, pos: int = 0):
         _, T, _ = x.shape
         
-        pos = torch.arange(0, T, device=DEVICE, dtype=torch.long)
+        # During inference, the sequence length is not always T
+        # In case of a partially completed sequence, T will always be 1
+        # Instead add the amount of tokens generated so far to account for positional embedding correctness
+        pos = torch.arange(pos, pos + T, device=DEVICE, dtype=torch.long)
         pos_emb = self.embedding(pos).unsqueeze(0) # [B,T,n_embed]
         
         return pos_emb
@@ -129,12 +133,94 @@ class SinusoidalPositionalEmbedding(nn.Module):
         return self.PE[:T].unsqueeze(0)
     
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model: int, n_head: int, base: int = 10000):
         super().__init__()
+        
+        self.d_model = d_model
+        self.n_head = n_head
+        self.base = base
+        
+        self.sin_cache = None
+        self.cos_cache = None
     
-    def forward(self, x):
-        pass
-       
+    @torch.no_grad()
+    def _build_cache(self, x: torch.Tensor, pos: int = 0):
+        if self.sin_cache is not None and pos + x.shape[1] <= self.sin_cache.shape[0]:
+            return # use the existing cache, no need to create or grow
+        
+        sequence_length = pos + x.shape[0]
+        d_head = self.d_model // self.n_head
+        
+        w = 1 / (self.base ** (torch.arange(0, d_head, 2).float() / d_head)).to(x.device) # 1 / 10000 ^ (2i / d_model)
+        positions = torch.arange(sequence_length, device=x.device)
+        
+        theta = positions.unsqueeze(1) * w.unsqueeze(0) # [sequence_length, 1] * [1, d_model/2] -> [sequence_length, d_model/2]
+        
+        theta = torch.repeat_interleave(theta, 2, dim=1) # [sequence_length, d_model]
+        
+        self.sin_cache = theta.sin()
+        self.cos_cache = theta.cos()
+    
+    def forward(self, x: torch.Tensor, pos: int = 0):
+        # x -> [B, T, n_head, d_head]
+        
+        self._build_cache(x, pos)
+        
+        x_odd = x[..., 1::2] # [B, T, n_head, d_head/2]
+        x_even = x[..., 0::2] # [B, T, n_head, d_head/2]
+        
+        cos = self.cos_cache[pos:pos+x.shape[1], 0::2] # [T, d_head/2]
+        sin = self.sin_cache[pos:pos+x.shape[1], 0::2] # [T, d_head/2]
+        
+        cos = cos.unsqueeze(0).unsqueeze(2) # [1, T, 1, d_head/2]
+        sin = sin.unsqueeze(0).unsqueeze(2) # [1, T, 1, d_head/2]
+        
+        rotated_even = x_even * cos - x_odd * sin # [B, T, n_head, d_head/2]
+        rotated_odd = x_even * sin + x_odd * cos # [B, T, n_head, d_head/2]
+
+        rotated_x = torch.stack([rotated_even, rotated_odd], dim=-1) # [B, T, n_head, d_head/2, 2]
+        rotated_x = torch.flatten(rotated_x, 2, 3) # handles interleaving odd,even indices -> [B, T, n_head, d_head]
+
+        return rotated_x   
+    
+class KVCache(nn.Module):
+    def __init__(self, n_layers: int, n_head: int, d_head: int, window_size: int, device="cuda"):
+        super().__init__()
+        
+        self.n_layers = n_layers
+        self.n_head = n_head
+        self.d_head = d_head
+        self.device = device
+        self.window_size =window_size
+        
+        self.cache = [(None, None) for _ in range(n_layers)]
+    
+    def is_empty(self):
+        return self.cache[0][0] is None
+    
+    def reset(self):
+        self.cache = [(None, None) for _ in range(self.n_layers)]
+    
+    def update(self, index: int, K_new: torch.Tensor, V_new: torch.Tensor):
+        K, V = self.cache[index]
+        
+        if K is None:
+            K, V = K_new, V_new # [B, n_head, T, d_head]
+        else:
+            K = torch.cat([K, K_new], dim=2)
+            V = torch.cat([V, V_new], dim=2)
+            
+        if self.window_size is not None and K.size(2) > self.window_size:
+            K = K[:, :, -self.window_size:, :]
+            V = V[:, :, -self.window_size:, :]
+
+        self.cache[index] = (K, V)
+        
+        return self.cache[index]
+    
+    def get(self, index):
+        return self.cache[index]
+     
 class MaskedSelfAttention(nn.Module):
     """Masked/Causal Self Attention"""
 
@@ -147,35 +233,54 @@ class MaskedSelfAttention(nn.Module):
         self.scale = self.d_head ** -0.5
         
         self.qkv_proj = nn.Linear(config.n_embed, 3*config.n_embed)
+        self.RoPE = RotaryPositionalEmbedding(config.n_embed)
         
         self.register_buffer("tril", torch.tril(torch.ones(config.context_length, config.context_length)))
         
         self.output_proj = nn.Linear(config.n_embed, config.n_embed)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
-        B, T, C = x.shape
-        
+    def forward(self, x, use_cache = False, cache: KVCache = None, layer_index = None, pos: int = 0):
+
         # Q = self.query(x) # [B,T,d_head]
         # K = self.key(x) # [B,T,d_head]
         # V = self.value(x) # [B,T,d_head]
         
+        # If using cache and not the initial prompt, slice for sequence length = 1 
+        # if use_cache and not cache.is_empty():
+        #     x = x[:,-1,:].unsqueeze(1)
+
+        B, T, C = x.shape
+
         qkv = self.qkv_proj(x) # [B,T,3*C]
         qkv = qkv.view(B, T,self.config.n_head, 3, self.d_head) # [B,T,n_head,3,d_head]
         Q,K,V = qkv[...,0,:], qkv[...,1,:], qkv[...,2,:] # [B,T,n_head,d_head]
         
+        Q = self.RoPE(Q, pos)
+        K = self.RoPE(K, pos)
+        
         Q = Q.transpose(1, 2) # [B, n_head, T, d_head]
-        K = K.transpose(1, 2) # [B, n_head, T, d_head]
-        V = V.transpose(1, 2) # [B, n_head, T, d_head]
-
+        K_new = K.transpose(1, 2) # [B, n_head, T, d_head] for training, [B, n_head, 1, d_head] for inference
+        V_new = V.transpose(1, 2) # [B, n_head, T, d_head]
+        
+        if use_cache:
+            assert cache is not None and layer_index is not None
+            K, V = cache.update(layer_index, K_new, V_new)
+        else:
+            K, V = K_new, V_new
+            
         if self.is_flash_attention:
-            output = nn.functional.scaled_dot_product_attention(Q,K,V,is_causal=True,scale=self.scale)
+            is_causal = cache is None
+            output = nn.functional.scaled_dot_product_attention(Q,K,V,is_causal=is_causal,scale=self.scale)
         else:
             # matrix multiplication happens on last 2 dimensions
             # [B, n_head, T, d_head] @ [B, n_head, d_head, T]
             W = (Q @ K.transpose(-2,-1)) * self.scale # [B, n_head, T, T]
-            mask = self.tril[:T, :T].unsqueeze(0).unsqueeze(0)
-            W = W.masked_fill(mask == 0, torch.finfo(W.dtype).min)
+            
+            if T > 1:
+                mask = self.tril[:Q.size(1), :K.size(1)].unsqueeze(0).unsqueeze(0)
+                W = W.masked_fill(mask == 0, torch.finfo(W.dtype).min)
+
             W = torch.softmax(W, dim=-1) # apply row-wise
             
             # [B, n_head, T, T] @ [B, n_head, T, d_head]
@@ -183,7 +288,9 @@ class MaskedSelfAttention(nn.Module):
         
         output = output.transpose(1,2) # [B, T, n_head, d_head]
         output = output.contiguous().view(B,T,C) # n_head * d_head -> C
-        return self.output_proj(output) # [B, T, C]
+        
+        # [B, T, C]
+        return self.output_proj(output)
 
 class LayerNorm(nn.Module):
     """Layern Normalization"""
@@ -199,7 +306,7 @@ class LayerNorm(nn.Module):
         
     def forward(self, x):
         x_mean = x.mean(dim=-1, keepdim=True)
-        x_var = x.var(dim=-1, keepdim=True)
+        x_var = x.var(dim=-1, keepdim=True, unbiased=False)
         
         x = (x - x_mean) / torch.sqrt(x_var + self.eps)
         
@@ -291,10 +398,17 @@ class Block(nn.Module):
         self.attention = MaskedSelfAttention(config)
         self.feed_forward = FeedForward(config)
         
-    def forward(self, x):
-        x = x + self.attention(self.norm_1(x))
-        x = x + self.feed_forward(self.norm_2(x))
+    def forward(self, x, use_cache=False, cache=None, layer_index=None, pos: int = 0):
+        shortcut = x
+        x = self.norm_1(x)
+        x = self.attention(x, use_cache, cache, layer_index, pos)
+        x = x + shortcut
         
+        shortcut = x
+        x = self.norm_2(x)
+        x = self.feed_forward(x)
+        x = x + shortcut
+                
         return x
 
 class GPT(nn.Module):
@@ -308,9 +422,8 @@ class GPT(nn.Module):
         
         self.transformer = nn.ModuleDict(dict(
             token_embedding = nn.Embedding(config.vocab_size, config.n_embed), # contextual embeddings
-            positional_embedding = LearnedPositionalEmbedding(config.context_length, config.n_embed), # learned positional embeddings
+            # positional_embedding = LearnedPositionalEmbedding(config.context_length, config.n_embed), # learned positional embeddings
             # positional_embedding = SinusoidalPositionalEmbedding(config.context_length, config.n_embed) # sinusoidal positional embedding
-            # positional_embedding = RotaryPositionalEmbedding(config.n_head, config.n_embed // config.n_head),
             blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # decoder blocks
             layer_norm_f = LayerNorm(config.n_embed) # additional layernorm
         ))
@@ -322,7 +435,7 @@ class GPT(nn.Module):
     
         # initialize weights
         self.apply(self._init_weights)
-    
+        
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02 * (2 * self.config.n_layer) ** -0.5 # scale residuals
@@ -390,7 +503,7 @@ class GPT(nn.Module):
         
         return filtered
     
-    def forward(self, index, targets=None):
+    def forward(self, index, targets=None, use_cache=False, cache=None, pos: int = 0):
         # index: [B,T]
         _,T = index.size()
         # H = self.config.n_head
@@ -402,13 +515,11 @@ class GPT(nn.Module):
         
         x = self.transformer.token_embedding(index) # [B,T,n_embed]
         
-        pos_emb = self.transformer.positional_embedding(x)
+        # pos_emb = self.transformer.positional_embedding(x, pos)
         
-        x = x + pos_emb
-        
-        for block in self.transformer.blocks:
-            x = block(x)
-        
+        for layer_index, block in enumerate(self.transformer.blocks):
+            x = block(x, use_cache, cache, layer_index, pos)
+
         x = self.transformer.layer_norm_f(x) # [B,T,n_embed]
         
         loss = None
@@ -427,9 +538,13 @@ class GPT(nn.Module):
         tokens = tokens.repeat(num_return_sequences, 1) # [num_return_sequences, T]
         tokens = tokens.to(DEVICE)
         
+        cache = KVCache(n_layers=model.config.n_layer, n_head=model.config.n_head, d_head=model.config.n_embed // model.config.n_head, window_size=model.config.context_length, device=DEVICE)
+        
+        pos = 0
+        
         while tokens.size(1) < max_output_tokens:
-            tokens_curr = tokens[:, -self.config.context_length:]
-            logits, _ = self(tokens_curr)
+            tokens_curr = tokens if cache.is_empty() else tokens[:, -1:]
+            logits, _ = self(tokens_curr, use_cache=True, cache=cache, pos=pos)
             logits = logits[:, -1, :] # logits at the last position
             
             logits = logits / max(temperature, 1e-6)
@@ -442,6 +557,7 @@ class GPT(nn.Module):
             
             # append new col to the sequence
             tokens = torch.cat((tokens, next_token), dim=1)
+            pos += tokens_curr.size(1)
             
         return tokens
         
@@ -503,8 +619,8 @@ class CustomDataLoader:
             dataset_dir = Path(__file__).parent / "edu_fineweb10B"
             shards = os.listdir(dataset_dir)
             self.shards = [f"{dataset_dir}/{s}" for s in shards if split in s]
-            self.current_shard = 0
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            # self.current_shard = 0
+            # self.tokens = load_tokens(self.shards[self.current_shard])
 
             assert len(self.shards) > 0, f"No shards found for split {split}"
 
@@ -530,6 +646,7 @@ class CustomDataLoader:
         if self.index + (self.B*self.T+1) > len(self.tokens):
             if self.dataset == "fineweb":
                 self.current_shard = (self.current_shard + 1) % len(self.shards)
+                self.tokens = load_tokens(self.shards[self.current_shard])
             self.index = 0
             
         return x,y            
@@ -563,6 +680,7 @@ def train_model(step: int):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+    
     for micro_step in range(gradient_accumulation_steps):
         x,y = train_loader.next_batch()
         x,y = x.to(DEVICE), y.to(DEVICE)
@@ -618,25 +736,59 @@ def evaluate_model():
     console.print(f"\n[green]Validation Loss: [/green]{val_loss_accum.item():.4f}\n")
     logger.info(f"Step {step}, Validation Loss {val_loss_accum.item():.4f}")
 
-def save_checkpoint(step, model, optimizer, scaler, path="checkpoints"):
+def save_checkpoint(step, model, optimizer, scaler, train_loader, path="checkpoints"):
     os.makedirs(path, exist_ok=True)
     
     checkpoint = {
+        # Training progress
         "step": step,
+        
+        # Model state
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict()
+        "scaler": scaler.state_dict(),  
+        
+        # Dataloader state
+        "dataloader_state": {
+            "index": train_loader.index,
+            "current_shard": train_loader.current_shard,
+        },
+        
+        # RNG state
+        "rng_state": {
+            "torch": torch.get_rng_state(),        
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(),
+            "python": random.getstate()
+        }
     }
     
-    torch.save(checkpoint, f"{path}/checkpoint_step_{step}.pt")
+    temp_path = f"{path}/latest.pt.temp"
+    final_path = f"{path}/latest.pt"
+    
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, final_path)
+    
     console.print(f"[green]Checkpoint saved[/green]")
 
-def load_checkpoint(path, model, optimizer, scalers):
+def load_checkpoint(path, model, optimizer, scaler, train_loader):
     checkpoint = torch.load(path, map_location=DEVICE)
 
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scaler.load_state_dict(checkpoint["scaler"])
+    
+    train_loader.index = checkpoint["dataloader_state"]["index"]
+    # If the dataset is not fineweb
+    if checkpoint["dataloader_state"]["current_shard"] is not None:
+        train_loader.current_shard = checkpoint["dataloader_state"]["current_shard"]
+        train_loader.tokens = load_tokens(train_loader.shards[train_loader.current_shard]) 
+        
+    torch.set_rng_state(checkpoint["rng_state"]["torch"])
+    np.random.set_state(checkpoint["rng_state"]["numpy"])
+    random.setstate(checkpoint["rng_state"]["python"])
+    if torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(checkpoint["rng_state"]["cuda"])
     
     console.print(f"[green]Checkpoint loaded[/green]")
     
@@ -644,7 +796,7 @@ def load_checkpoint(path, model, optimizer, scalers):
 
 def get_predicted_row(tokens, mask, logits):
     shifted_logits = logits[..., :-1, :].contiguous()
-    shifted_tokens = logits[..., 1:, :].contiguous()
+    shifted_tokens = tokens[..., 1:, :].contiguous()
     
     flattened_logits = shifted_logits.view(-1, shifted_logits.size(-1))
     flattened_tokens = shifted_tokens.view(-1)
@@ -662,6 +814,23 @@ def get_predicted_row(tokens, mask, logits):
     
     return prediction
 
+def completion():
+    num_return_sequences = 3
+    max_length = 32
+    
+    tokenizer = Tokenizer()
+
+    prompt = "Hello, I'm a language model"
+    input_tokens = tokenizer.encode(prompt)
+
+    generated_tokens = model.generate(tokens=input_tokens, max_output_tokens=max_length, num_return_sequences=num_return_sequences)      
+
+    print()
+    for i in range(num_return_sequences):
+        tokens = generated_tokens[i, :max_length].tolist()
+        decoded_tokens = tokenizer.decode(tokens)
+        console.print(f"{i}: {decoded_tokens}")
+    print()
 
 if __name__ == "__main__":
     # torch.set_float32_matmul_precision("high")
@@ -692,13 +861,18 @@ if __name__ == "__main__":
     val_loader = CustomDataLoader(B, T, split="val", dataset="shakespeare")
 
     # Hellaswag 
-    hellaswag_dataset = HellaSwagDataset(split="train")
-    hellaswag_dataloader = DataLoader(hellaswag_dataset, batch_size=4, shuffle=True)
+    hellaswag_dataset = HellaSwagDataset(split="val")
+    hellaswag_dataloader = DataLoader(hellaswag_dataset, batch_size=1, shuffle=True)
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=DEVICE)
     scaler = torch.amp.GradScaler(device=DEVICE, enabled=(DEVICE == "cuda"))
 
-    step = 0
+    resume_checkpoint_path = None
+    
+    if resume_checkpoint_path is not None:
+        step = load_checkpoint(resume_checkpoint_path, model, optimizer, scaler, train_loader)
+    else:
+        step = 0
     
     try:
         while step < max_steps:
@@ -730,10 +904,10 @@ if __name__ == "__main__":
                             logits, loss = model(tokens)
                             
                         predicted_norm = get_predicted_row(tokens, mask, logits)
-                    
-                num_total += 1
-                num_correct_norm = (predicted_norm == label)
-                
+
+                        num_correct_norm += int(predicted_norm == label.item())
+                        num_total += 1
+                        
                 accuracy = num_correct_norm / num_total    
                 
                 console.print(f"\n[green]Hellaswag Accuracy: [/green]{accuracy:.4f}\n")
@@ -756,20 +930,4 @@ if __name__ == "__main__":
         console.print(f"[red]Saving checkpoint...[/red]")
 
         save_checkpoint(step, model, optimizer, scaler)
-    
-    num_return_sequences = 3
-    max_length = 32
-    
-    tokenizer = Tokenizer()
-
-    prompt = "Hello, I'm a language model"
-    input_tokens = tokenizer.encode(prompt)
-
-    generated_tokens = model.generate(tokens=input_tokens, max_output_tokens=max_length, num_return_sequences=num_return_sequences)      
-
-    print()
-    for i in range(num_return_sequences):
-        tokens = generated_tokens[i, :max_length].tolist()
-        decoded_tokens = tokenizer.decode(tokens)
-        console.print(f"{i}: {decoded_tokens}")
-    print()
+        exit(1)
