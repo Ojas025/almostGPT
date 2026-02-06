@@ -213,3 +213,7 @@
 29-01-2026 21:37:06 | INFO | __main__ | Step 209, Loss: 5.7240
 29-01-2026 21:39:17 | INFO | __main__ | Step 210, Loss: 5.6940
 29-01-2026 21:41:31 | INFO | __main__ | Step 211, Loss: 5.7019
+01-02-2026 08:20:55 | DEBUG | urllib3.connectionpool | Starting new HTTPS connection (1): openaipublic.blob.core.windows.net:443
+01-02-2026 08:20:57 | DEBUG | urllib3.connectionpool | https://openaipublic.blob.core.windows.net:443 "GET /gpt-2/encodings/main/vocab.bpe HTTP/1.1" 200 456318
+01-02-2026 08:20:58 | DEBUG | urllib3.connectionpool | Starting new HTTPS connection (1): openaipublic.blob.core.windows.net:443
+01-02-2026 08:21:00 | DEBUG | urllib3.connectionpool | https://openaipublic.blob.core.windows.net:443 "GET /gpt-2/encodings/main/encoder.json HTTP/1.1" 200 1042301

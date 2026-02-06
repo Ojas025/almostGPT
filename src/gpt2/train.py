@@ -20,11 +20,13 @@ Stuff implemented:
     - Add RMS Norm over LayerNorm to reduce computations
     - Added checkpointing to resume training state
     - Implement Rotary Positional Embeddings (RoPE)
-    
-TODO:
     - Implement Grouped Multi-Query Attention
     - Implement Sliding Window Attention
+    
+TODO:
     - Implement Rolling KV Cache
+    - Add Mixture-of-Experts
+    - LoRA Fine Tuning
     - Custom Flash Attention? (Cuda)
 """
 
@@ -148,7 +150,7 @@ class RotaryPositionalEmbedding(nn.Module):
         if self.sin_cache is not None and pos + x.shape[1] <= self.sin_cache.shape[0]:
             return # use the existing cache, no need to create or grow
         
-        sequence_length = pos + x.shape[0]
+        sequence_length = pos + x.shape[1]
         d_head = self.d_model // self.n_head
         
         w = 1 / (self.base ** (torch.arange(0, d_head, 2).float() / d_head)).to(x.device) # 1 / 10000 ^ (2i / d_model)
@@ -162,24 +164,29 @@ class RotaryPositionalEmbedding(nn.Module):
         self.cos_cache = theta.cos()
     
     def forward(self, x: torch.Tensor, pos: int = 0):
-        # x -> [B, T, n_head, d_head]
+        # x -> [B, T, n_head or n_group, d_head]
+        n_dim = x.shape[2]
         
         self._build_cache(x, pos)
         
-        x_odd = x[..., 1::2] # [B, T, n_head, d_head/2]
-        x_even = x[..., 0::2] # [B, T, n_head, d_head/2]
+        x_odd = x[..., 1::2] # [B, T, n_dim, d_head/2]
+        x_even = x[..., 0::2] # [B, T, n_dim, d_head/2]
         
         cos = self.cos_cache[pos:pos+x.shape[1], 0::2] # [T, d_head/2]
         sin = self.sin_cache[pos:pos+x.shape[1], 0::2] # [T, d_head/2]
         
+        rot_dim = x_even.shape[-1]
+        cos = cos[..., :rot_dim]
+        sin = sin[..., :rot_dim]
+        
         cos = cos.unsqueeze(0).unsqueeze(2) # [1, T, 1, d_head/2]
         sin = sin.unsqueeze(0).unsqueeze(2) # [1, T, 1, d_head/2]
         
-        rotated_even = x_even * cos - x_odd * sin # [B, T, n_head, d_head/2]
-        rotated_odd = x_even * sin + x_odd * cos # [B, T, n_head, d_head/2]
+        rotated_even = x_even * cos - x_odd * sin # [B, T, n_dim, d_head/2]
+        rotated_odd = x_even * sin + x_odd * cos # [B, T, n_dim, d_head/2]
 
-        rotated_x = torch.stack([rotated_even, rotated_odd], dim=-1) # [B, T, n_head, d_head/2, 2]
-        rotated_x = torch.flatten(rotated_x, 2, 3) # handles interleaving odd,even indices -> [B, T, n_head, d_head]
+        rotated_x = torch.stack([rotated_even, rotated_odd], dim=-1) # [B, T, n_dim, d_head/2, 2]
+        rotated_x = torch.flatten(rotated_x, 2, 3) # handles interleaving odd,even indices -> [B, T, n_dim, d_head]
 
         return rotated_x   
     
@@ -216,29 +223,54 @@ class KVCache(nn.Module):
 
         self.cache[index] = (K, V)
         
-        return self.cache[index]
+        return K.clone(), V.clone()
     
     def get(self, index):
-        return self.cache[index]
+        K, V = self.cache[index]
+        return K.clone(), V.clone()
      
 class MaskedSelfAttention(nn.Module):
     """Masked/Causal Self Attention"""
 
-    def __init__(self, config: GPTConfig, dropout=0.2, is_flash_attention=True):
+    def __init__(self, config: GPTConfig, n_group, dropout=0.2, is_flash_attention=True, sliding_window: int = None, attention_sink: int = None):
         super().__init__()
+        assert config.n_embed % config.n_head == 0, "Embedding size must be divisible by number of heads"
+        assert config.n_head % n_group == 0, "Number of heads must be divisible by number of groups" 
         
         self.is_flash_attention = is_flash_attention
         self.config = config
         self.d_head = config.n_embed // config.n_head
         self.scale = self.d_head ** -0.5
+        self.groups = n_group
+        self.group_size = config.n_head // n_group
         
-        self.qkv_proj = nn.Linear(config.n_embed, 3*config.n_embed)
-        self.RoPE = RotaryPositionalEmbedding(config.n_embed)
+        # self.qkv_proj = nn.Linear(config.n_embed, 3*config.n_embed) # For Multi-head Attention
         
-        self.register_buffer("tril", torch.tril(torch.ones(config.context_length, config.context_length)))
+        # Sliding window attention
+        self.sliding_window = sliding_window
+        self.attention_sink = attention_sink
+        
+        # For Grouped Multi-Query Attention
+        self.q_proj = nn.Linear(config.n_embed, config.n_head * self.d_head)
+        self.k_proj = nn.Linear(config.n_embed, n_group * self.d_head)
+        self.v_proj = nn.Linear(config.n_embed, n_group * self.d_head)
+        
+        self.RoPE = RotaryPositionalEmbedding(self.d_head, config.n_head)
+        
+        # self.register_buffer("tril", torch.tril(torch.ones(config.context_length, config.context_length)))
         
         self.output_proj = nn.Linear(config.n_embed, config.n_embed)
         self.dropout = nn.Dropout(dropout)
+      
+    def build_sliding_window_mask(self, q_len, kv_len, sliding_window, attention_sink) -> torch.Tensor:
+        i = torch.arange(q_len, device=DEVICE)[:, None]
+        j = torch.arange(kv_len, device=DEVICE)[None, :]
+        
+        causal = i >= j
+        sink = j < attention_sink
+        local = j >= (i - sliding_window)
+
+        return causal & (local | sink)
         
     def forward(self, x, use_cache = False, cache: KVCache = None, layer_index = None, pos: int = 0):
 
@@ -252,34 +284,60 @@ class MaskedSelfAttention(nn.Module):
 
         B, T, C = x.shape
 
-        qkv = self.qkv_proj(x) # [B,T,3*C]
-        qkv = qkv.view(B, T,self.config.n_head, 3, self.d_head) # [B,T,n_head,3,d_head]
-        Q,K,V = qkv[...,0,:], qkv[...,1,:], qkv[...,2,:] # [B,T,n_head,d_head]
+        Q = self.q_proj(x) # [B, T, n_head, d_head]
+        K = self.k_proj(x) # [B, T, n_group, d_head]
+        V = self.v_proj(x) # [B, T, n_group, d_head]
         
-        Q = self.RoPE(Q, pos)
-        K = self.RoPE(K, pos)
+
+        # qkv = self.qkv_proj(x) # [B,T,3*C]
+        # qkv = qkv.view(B, T,self.config.n_head, 3, self.d_head) # [B,T,n_head,3,d_head]
+        # Q,K,V = qkv[...,0,:], qkv[...,1,:], qkv[...,2,:] # [B,T,n_head,d_head]
+        
+        # K = K.view(B, T, self.groups, self.config.d_head).transpose(1, 2)
+        # V = V.view(B, T, self.groups, self.config.d_head).transpose(1, 2)
+        
+        Q = self.RoPE(Q, pos) # [B, T, n_head, d_head]
+        K = self.RoPE(K, pos) # [B, T, n_group, d_head]
         
         Q = Q.transpose(1, 2) # [B, n_head, T, d_head]
-        K_new = K.transpose(1, 2) # [B, n_head, T, d_head] for training, [B, n_head, 1, d_head] for inference
-        V_new = V.transpose(1, 2) # [B, n_head, T, d_head]
+        K_new = K.transpose(1, 2) # [B, n_group, T, d_head]
+        V_new = V.transpose(1, 2) # [B, n_group, T, d_head]
+        # Q = Q.transpose(1, 2) # [B, n_head, T, d_head]
+        # K_new = K.transpose(1, 2) # [B, n_head, T, d_head] for training, [B, n_head, 1, d_head] for inference
+        # V_new = V.transpose(1, 2) # [B, n_head, T, d_head]
         
         if use_cache:
             assert cache is not None and layer_index is not None
             K, V = cache.update(layer_index, K_new, V_new)
+            
+            if T == 1:
+                sliding_window_mask = None
         else:
             K, V = K_new, V_new
             
+        K = K.repeat_interleave(self.group_size, dim=1)
+        V = V.repeat_interleave(self.group_size, dim=1)
+        
+        if self.sliding_window is not None:
+            sliding_window_mask = self.build_sliding_window_mask(T, K.size(2), self.sliding_window, self.attention_sink)
+            sliding_window_mask = sliding_window_mask[None, None, :, :]
+            
         if self.is_flash_attention:
-            is_causal = cache is None
-            output = nn.functional.scaled_dot_product_attention(Q,K,V,is_causal=is_causal,scale=self.scale)
+            is_causal = (True if cache is None else False) and (sliding_window_mask is None)
+            output = nn.functional.scaled_dot_product_attention(Q,K,V,is_causal=is_causal,scale=self.scale, attn_mask=sliding_window_mask)
         else:
             # matrix multiplication happens on last 2 dimensions
             # [B, n_head, T, d_head] @ [B, n_head, d_head, T]
             W = (Q @ K.transpose(-2,-1)) * self.scale # [B, n_head, T, T]
             
-            if T > 1:
-                mask = self.tril[:Q.size(1), :K.size(1)].unsqueeze(0).unsqueeze(0)
-                W = W.masked_fill(mask == 0, torch.finfo(W.dtype).min)
+            # if T > 1:
+                # mask = self.tril[:T, :K.size(2)].unsqueeze(0).unsqueeze(0)
+                # W = W.masked_fill(mask == 0, torch.finfo(W.dtype).min)
+                
+            if sliding_window_mask is not None:
+                W = W.masked_fill(
+                    ~sliding_window_mask, torch.finfo(W.dtype).min
+                )
 
             W = torch.softmax(W, dim=-1) # apply row-wise
             
@@ -395,7 +453,7 @@ class Block(nn.Module):
             self.norm_1 = RMSNorm(config.n_embed)
             self.norm_2 = RMSNorm(config.n_embed)
         
-        self.attention = MaskedSelfAttention(config)
+        self.attention = MaskedSelfAttention(config, n_group=6)
         self.feed_forward = FeedForward(config)
         
     def forward(self, x, use_cache=False, cache=None, layer_index=None, pos: int = 0):
