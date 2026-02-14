@@ -8,7 +8,7 @@ def configure_logging(debug_level="INFO"):
 
     if not LOG_DIR.exists():
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-    
+       
     LOGGING_CONFIG = {
         "version": 1,
         "disable_existing_loggers": True,
