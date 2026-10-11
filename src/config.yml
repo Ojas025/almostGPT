@@ -1,0 +1,93 @@
+defaults:
+
+  model:
+    context_length: 1024
+    vocab_size: 50304
+    n_layer: 12
+    n_head: 12
+    n_embed: 768
+    norm_type: rms
+    tie_embeddings: true
+    attention:
+      n_group: 6
+      is_flash_attention: true
+      sliding_window: null
+      attention_sink: null
+      dropout: 0.2
+    moe:
+      enabled: true
+      num_experts: 32
+      d_hidden_multiplier: 4
+      top_k: 1
+      capacity_factor: 1.0
+      min_capacity: 4
+      z_loss_coef: 0.001
+      aux_loss_coef: 0.01
+      dropout: 0.0
+    kv_cache:
+      enabled: true
+      window: null
+      sink: 4
+
+  data:
+    dataset: fineweb
+    tokenizer: gpt2
+
+  train:
+    batch_size: 16
+    context: 1024
+    total_batch_size: 524288
+    learning_rate: 0.0006
+    min_lr_ratio: 0.1
+    warmup_steps: 2000
+    max_steps: 19073
+    weight_decay: 0.1
+    grad_clip: 1.0
+    device: auto
+    amp: true
+    compile: true
+    eval_interval: 250
+    checkpoint_interval: 5000
+    log_interval: 1
+    seed: 20260911
+    run_hellaswag: false
+
+  generate:
+    max_new_tokens: 200
+    num_return_sequences: 3
+    temperature: 1.0
+    top_k: 50
+    top_p: 0.95
+
+
+profiles:
+  smoke:
+    model:
+      n_layer: 2
+      n_head: 6
+      n_embed: 96
+      context_length: 64
+      moe:
+        enabled: false
+    data:
+      dataset: shakespeare
+    train:
+      batch_size: 2
+      context: 32
+      total_batch_size: 64
+      max_steps: 5
+      warmup_steps: 1
+      device: cpu
+      amp: false
+      compile: false
+      eval_interval: 5
+      checkpoint_interval: 5
+      run_hellaswag: false
+    generate:
+      max_new_tokens: 40
+      num_return_sequences: 1
+
+  dense:
+    model:
+      moe:
+        enabled: false

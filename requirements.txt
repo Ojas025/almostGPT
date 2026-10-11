@@ -1,5 +1,9 @@
-numpy
-logging
-rich
-typer
-ipykernel
+torch>=2.2
+numpy>=1.26
+tiktoken>=0.7
+rich>=13.7
+tqdm>=4.66
+datasets>=2.19
+requests>=2.31
+pydantic>=2.7    # config schema validation
+pyyaml>=6.0      # config.yml parsing

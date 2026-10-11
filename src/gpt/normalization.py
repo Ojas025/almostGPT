@@ -7,9 +7,15 @@ logger = logging.getLogger(__name__)
 
 
 class LayerNorm(nn.Module):
-    """Layern Normalization"""
+    """
+    Layern Normalization
 
-    def __init__(self, n_embed, eps=1e-5):
+    - LayerNorm normalizes across C
+    - Does not operate across B
+    - beta and gamma are trainable parameters, for normalization to not be too restrictive
+    """
+
+    def __init__(self, n_embed: int, eps: float = 1e-5) -> None:
         super().__init__()
 
         self.eps = eps
@@ -18,7 +24,7 @@ class LayerNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(n_embed))
         self.beta = nn.Parameter(torch.zeros(n_embed))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_mean = x.mean(dim=-1, keepdim=True)
         x_var = x.var(dim=-1, keepdim=True, unbiased=False)
 
@@ -45,7 +51,7 @@ class RMSNorm(nn.Module):
 
         self.scale = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
 
         return (x / rms) * self.scale

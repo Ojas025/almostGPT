@@ -8,3 +8,6 @@ __pycache__/
 *.pt
 *.__pycache__
 venv_linux
+checkpoints/
+runs/
+.venv/

@@ -1,17 +1,21 @@
 """FineWeb-Edu dataset"""
 
 import os
+import sys
 import multiprocessing as mp
+from pathlib import Path
+
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 
-local_dir = "edu_fineweb10B"
+from ..gpt.config import SHARD_DIR
+
 remote_name = "sample-10BT"
 shard_size = int(5e7)
 
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+DATA_CACHE_DIR = str(SHARD_DIR)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # init tokenizer

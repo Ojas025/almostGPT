@@ -1,0 +1,22 @@
+[project]
+name = "almostgpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ojas", email = "OjasD025@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic",
+]
+
+[project.scripts]
+almostgpt = "almostgpt:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[uv.tools]
+package = false

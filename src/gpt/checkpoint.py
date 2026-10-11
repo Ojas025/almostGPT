@@ -4,14 +4,21 @@ import random
 
 import numpy as np
 import torch
-from train import DEVICE, console
+from .console import console
 
-from data import load_tokens
+from .data import load_tokens
 
 logger = logging.getLogger(__name__)
 
 
-def save_checkpoint(step, model, optimizer, scaler, train_loader, path="checkpoints"):
+def save_checkpoint(
+    step: int,
+    model,
+    optimizer,
+    scaler,
+    train_loader,
+    path: str = "checkpoints",
+) -> None:
     os.makedirs(path, exist_ok=True)
 
     checkpoint = {
@@ -21,10 +28,11 @@ def save_checkpoint(step, model, optimizer, scaler, train_loader, path="checkpoi
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
-        # Dataloader state
+        # Dataloader state. `current_shard` is set only by the fineweb path, so it is read
+        # defensively -- it does not exist for shakespeare.
         "dataloader_state": {
             "index": train_loader.index,
-            "current_shard": train_loader.current_shard,
+            "current_shard": getattr(train_loader, "current_shard", None),
         },
         # RNG state
         "rng_state": {
@@ -46,8 +54,20 @@ def save_checkpoint(step, model, optimizer, scaler, train_loader, path="checkpoi
     console.print("[green]Checkpoint saved[/green]")
 
 
-def load_checkpoint(path, model, optimizer, scaler, train_loader):
-    checkpoint = torch.load(path, map_location=DEVICE)
+def load_checkpoint(
+    path: str,
+    model,
+    optimizer,
+    scaler,
+    train_loader,
+    device: str = "cpu",
+) -> int:
+    # weights_only=False is deliberate: the checkpoint stores RNG state (numpy / python
+    # random / torch generators) so a resumed run continues from the same stochastic
+    # point. Those objects are not on torch's default allowlist, and torch >= 2.6
+    # defaults weights_only=True, which made every resume fail with an
+    # UnpicklingError. Safe here because we wrote this file ourselves.
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
 
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -55,8 +75,15 @@ def load_checkpoint(path, model, optimizer, scaler, train_loader):
 
     train_loader.index = checkpoint["dataloader_state"]["index"]
     # If the dataset is not fineweb
-    if checkpoint["dataloader_state"]["current_shard"] is not None:
-        train_loader.current_shard = checkpoint["dataloader_state"]["current_shard"]
+    # Only re-open a shard if this loader actually has shards; shakespeare has none.
+    if checkpoint["dataloader_state"]["current_shard"] is not None and getattr(
+        train_loader, "shards", None
+    ):
+        train_loader.current_shard = (
+            checkpoint["dataloader_state"]["current_shard"]
+            if checkpoint["dataloader_state"]["current_shard"] is not None
+            else None
+        )
         train_loader.tokens = load_tokens(
             train_loader.shards[train_loader.current_shard]
         )

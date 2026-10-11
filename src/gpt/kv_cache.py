@@ -5,35 +5,43 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-
 class KVCache(nn.Module):
     def __init__(
         self,
         n_layers: int,
-        n_head: int,
         d_head: int,
         window: int,
         sink: int,
-        device="cuda",
-    ):
+        device: str = "cpu",
+        n_group: int | None = None,
+        n_head: int | None = None,
+    ) -> None:
         super().__init__()
 
         self.n_layers = n_layers
-        self.n_head = n_head
         self.d_head = d_head
         self.device = device
         self.window = window
         self.sink = sink
 
+        if n_head:
+            self.attention_type = "mha"
+            self.n_head = n_head
+        elif n_group:
+            self.attention_type = "gqa"
+            self.n_group = n_group
+
         self.cache = [(None, None) for _ in range(n_layers)]
 
-    def is_empty(self):
+    def is_empty(self) -> bool:
         return self.cache[0][0] is None
 
-    def reset(self):
+    def reset(self) -> None:
         self.cache = [(None, None) for _ in range(self.n_layers)]
 
-    def update(self, index: int, K_new: torch.Tensor, V_new: torch.Tensor):
+    def update(
+        self, index: int, K_new: torch.Tensor, V_new: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         K, V = self.cache[index]
 
         if K is None:
@@ -48,8 +56,8 @@ class KVCache(nn.Module):
 
         self.cache[index] = (K, V)
 
-        return K.clone(), V.clone()
+        return K, V
 
-    def get(self, index):
+    def get(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         K, V = self.cache[index]
-        return K.clone(), V.clone()
+        return K, V

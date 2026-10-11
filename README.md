@@ -1,4 +1,4 @@
-# AlmostGPT
+# AlmostGPT: A Minimal Modern LLM Architecture Lab
 
 This repository contains a from-scratch implementation of a GPT-style Transformer language model with a strong emphasis on architectural correctness, numerical stability, and production-oriented training mechanics. The project explores deviations from the original Transformer paper, incorporates modern optimization techniques, and serves as a foundation for further research into efficient attention mechanisms and scalable training.
 
@@ -81,8 +81,29 @@ Planned improvements and research extensions:
 Example:
 
 ```bash
-python src/gpt2/train.py
+# Smoke run: tiny model, Shakespeare, CPU, 5 steps. Runs in about 6 seconds.
+python -m src.gpt.train --profile smoke
+
+# Real run: values come from the `defaults:` block in src/config.yml
+python -m src.gpt.train
 ```
+
+Run from the repository root. `src/` is a package, so `src/gpt` and its siblings
+(`src/logger.py`, `src/dataset/`) resolve as ordinary relative imports.
+
+All tunable values live in [`src/config.yml`](src/config.yml) — model dimensions,
+attention/MoE/KV-cache settings, dataset, and the training schedule. Named runs
+(`smoke`, `dense`) are `profiles:` entries merged over `defaults:`, so a
+profile only states what it changes:
+
+```yaml
+profiles:
+  smoke:
+    train: { max_steps: 5, device: cpu }
+```
+
+Schemas are declared in [`src/gpt/config.py`](src/gpt/config.py), so field types are
+checked when the config is loaded.
 
 ---
 

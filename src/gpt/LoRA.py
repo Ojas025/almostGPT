@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+    def __init__(self, base: nn.Linear, rank: int, alpha: float) -> None:
         super().__init__()
 
         self.rank = rank
@@ -27,7 +27,7 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         nn.init.zeros_(self.B)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_output = self.base(x)
         lora_output = (x @ self.A.T) @ self.B.T
 
