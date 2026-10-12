@@ -15,6 +15,7 @@ class SwiGLU(nn.Module):
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
         self.projection = nn.Linear(in_dim, out_dim * 2)
+        nn.init.zeros_(self.projection.bias)
         self.silu = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -40,7 +40,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         # For each timestep, one positional embedding
         embeddings = torch.zeros(T, n_embed, dtype=torch.float16)
 
-        angles = positions / denominator
+        angles = positions[:, None] / denominator[None, :]
         embeddings[:, 0::2] = torch.sin(angles)  # sine for even positions
 
         embeddings[:, 1::2] = torch.cos(angles)  # cosine for odd positions

@@ -64,10 +64,11 @@ class MaskedSelfAttention(nn.Module):
         sliding_window: int,
         attention_sink: int,
         device: torch.device,
+        pos: int = 0,
     ) -> torch.Tensor:
         # Device comes from the caller's activations rather than a module-level global, so
         # the mask is always built on the same device as Q/K/V.
-        i = torch.arange(q_len, device=device)[:, None]
+        i = pos + torch.arange(q_len, device=device)[:, None]
         j = torch.arange(kv_len, device=device)[None, :]
 
         causal = i >= j
@@ -129,7 +130,7 @@ class MaskedSelfAttention(nn.Module):
 
         if self.sliding_window is not None:
             sliding_window_mask = self.build_sliding_window_mask(
-                T, K.size(2), self.sliding_window, self.attention_sink, x.device
+                T, K.size(2), self.sliding_window, self.attention_sink, x.device, pos=pos
             )
             sliding_window_mask = sliding_window_mask[None, None, :, :]
 
@@ -158,6 +159,12 @@ class MaskedSelfAttention(nn.Module):
 
             if sliding_window_mask is not None:
                 W = W.masked_fill(~sliding_window_mask, torch.finfo(W.dtype).min)
+            elif cache is None:
+                causal_mask = (
+                    torch.arange(T, device=x.device)[:, None]
+                    >= torch.arange(K.size(2), device=x.device)[None, :]
+                )
+                W = W.masked_fill(~causal_mask, torch.finfo(W.dtype).min)
 
             W = torch.softmax(W, dim=-1)  # apply row-wise
 

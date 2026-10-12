@@ -101,18 +101,26 @@ class CustomDataLoader:
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the next (inputs, targets) pair, advancing or wrapping as needed."""
-        buffer = self.tokens[self.index : self.index + self.B * self.T + 1]
-
-        x = buffer[:-1].view(self.B, self.T)
-        y = buffer[1:].view(self.B, self.T)
-
-        self.index += self.B * self.T
-
-        if self.index + (self.B * self.T + 1) > len(self.tokens):
+        needed = self.B * self.T + 1
+        if self.index + needed <= len(self.tokens):
+            buffer = self.tokens[self.index : self.index + needed]
+            self.index += self.B * self.T
+            if self.index >= len(self.tokens) - 1:
+                if self.dataset == "fineweb":
+                    self.current_shard = (self.current_shard + 1) % len(self.shards)
+                    self.tokens = load_tokens(self.shards[self.current_shard])
+                self.index = 0
+        else:
+            part1 = self.tokens[self.index:]
             if self.dataset == "fineweb":
                 self.current_shard = (self.current_shard + 1) % len(self.shards)
                 self.tokens = load_tokens(self.shards[self.current_shard])
+            rem = needed - len(part1)
+            part2 = self.tokens[:rem]
+            buffer = torch.cat([part1, part2])
+            self.index = rem - 1
 
-            self.index = 0
+        x = buffer[:-1].view(self.B, self.T)
+        y = buffer[1:].view(self.B, self.T)
 
         return x, y

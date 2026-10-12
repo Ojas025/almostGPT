@@ -108,13 +108,14 @@ class GPT(nn.Module):
         cumsum = torch.cumsum(probabilities, dim=-1)
 
         mask = cumsum > p
+        mask[..., 1:] = mask[..., :-1].clone()
         mask[..., 0] = False  # keep at least the first token
 
         sorted_logits[mask] = float("-inf")
 
         # unsort
         filtered = torch.full_like(sorted_logits, float("-inf"))
-        filtered.scatter_(1, sorted_indices, sorted_logits)
+        filtered.scatter_(-1, sorted_indices, sorted_logits)
 
         return filtered
 
